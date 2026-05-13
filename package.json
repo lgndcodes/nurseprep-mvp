@@ -1,0 +1,24 @@
+{
+  "name": "nurseprep-backend",
+  "version": "0.1.0",
+  "description": "NursePrep nursing exam prep SaaS — Node.js backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test:pipeline": "node src/test-pipeline.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.49.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1",
+    "officeparser": "^4.2.0",
+    "openai": "^4.85.1",
+    "pdf-parse": "^1.1.1"
+  }
+}

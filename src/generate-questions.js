@@ -1,0 +1,272 @@
+/**
+ * NCLEX-style question generation pipeline using Claude + Supabase.
+ */
+
+require('dotenv').config();
+const Anthropic = require('@anthropic-ai/sdk');
+const supabase = require('./supabase');
+const { embedText } = require('./embeddings');
+
+const MODEL = 'claude-sonnet-4-5';
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+function parseClaudeJson(text) {
+  const cleaned = String(text)
+    .replace(/```json\n?/gi, '')
+    .replace(/```\n?/g, '')
+    .trim();
+  return JSON.parse(cleaned);
+}
+
+function getAssistantText(message) {
+  if (!message?.content || !Array.isArray(message.content)) return '';
+  return message.content
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text)
+    .join('');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function extractConcepts(documentId, chunks) {
+  const context = chunks.slice(0, 5).join('\n\n---\n\n');
+
+  const message = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 4000,
+    system: 'You are an expert nursing educator and NCLEX exam specialist.',
+    messages: [
+      {
+        role: 'user',
+        content: `Analyze this nursing study material and extract NCLEX-testable concepts.
+
+Return ONLY a JSON array. Each object must have:
+- topic_name (string)
+- nclex_category (one of: "Safe and Effective Care", "Health Promotion", "Psychosocial Integrity", "Physiological Integrity")
+- importance_score (integer 1-10)
+
+No other text, no markdown. Material:
+
+${context}`,
+      },
+    ],
+  });
+
+  const responseText = getAssistantText(message);
+  const concepts = parseClaudeJson(responseText);
+
+  if (!Array.isArray(concepts) || concepts.length === 0) {
+    console.log('Extracted 0 concepts from document');
+    return [];
+  }
+
+  const rows = concepts.map((c) => ({
+    document_id: documentId,
+    topic_name: c.topic_name,
+    nclex_category: c.nclex_category,
+    importance_score: c.importance_score,
+  }));
+
+  const { data: inserted, error } = await supabase.from('concepts').insert(rows).select();
+  if (error) throw error;
+
+  console.log(`Extracted ${inserted.length} concepts from document`);
+  return inserted;
+}
+
+async function getRelevantChunks(documentId, topicName) {
+  const embedding = await embedText(topicName);
+
+  const { data, error } = await supabase.rpc('match_document_chunks', {
+    query_embedding: embedding,
+    match_document_id: documentId,
+    match_count: 5,
+  });
+
+  if (error) throw error;
+  if (!data || !Array.isArray(data)) return [];
+
+  return data.map((row) => row.chunk_text ?? row.content ?? '').filter(Boolean);
+}
+
+async function generateQuestionsForConcept(concept, relevantChunks) {
+  const context = relevantChunks.length
+    ? relevantChunks.join('\n\n---\n\n')
+    : '(No matching chunks.)';
+
+  const createParams = {
+    model: MODEL,
+    max_tokens: 12000,
+    system:
+      'You are an expert NCLEX question writer and nursing educator. You write difficult, clinically realistic questions and complete rationales in one pass.',
+    messages: [
+      {
+        role: 'user',
+        content: `Using ONLY the study material below, generate exactly 3 difficult NCLEX-style exam questions about: "${concept.topic_name}".
+
+Requirements:
+- Questions must require clinical judgment and application, not memorization.
+- Use realistic patient scenarios with clinical context where appropriate.
+- For EACH question in the same response: write the question, full rationales, and self-review quality (quality_passes).
+- Use ONLY information from the provided material.
+
+Return ONLY a JSON array of exactly 3 objects. Each object must have ALL of these fields:
+- question_text (string)
+- question_type: "mcq" or "sata"
+- answer_choices: array of { "letter", "text" }
+- correct_answer (string)
+- difficulty: integer — use 4 or 5 when quality_passes is true; use 2 when quality_passes is false (lower confidence)
+- nclex_framework (string)
+- rationale: string, 4-6 sentences of clinical explanation of why the correct answer is correct
+- trap_explanations: object whose keys are wrong-answer letters and values explain why each wrong option is tempting
+- clinical_pearl: string, one sentence key nursing insight
+- quality_passes: boolean — true if the item meets NCLEX quality standards (clear single best answer, clinically realistic, tests judgment not pure recall); false if it has material problems
+
+Study material:
+${context}`,
+      },
+    ],
+  };
+
+  let message;
+  for (let rateAttempt = 0; rateAttempt < 2; rateAttempt += 1) {
+    try {
+      message = await anthropic.messages.create(createParams);
+      break;
+    } catch (err) {
+      const isRateLimit =
+        err instanceof Anthropic.RateLimitError || err?.status === 429;
+      if (isRateLimit && rateAttempt === 0) {
+        console.log('Rate limit hit - waiting 60 seconds before retry...');
+        await sleep(60000);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  const responseText = getAssistantText(message);
+
+  let questions;
+  try {
+    questions = parseClaudeJson(responseText);
+  } catch (err) {
+    console.warn('generateQuestionsForConcept: failed to parse JSON from Claude:', err);
+    return [];
+  }
+
+  if (!Array.isArray(questions)) {
+    console.warn('generateQuestionsForConcept: response was not a JSON array');
+    return [];
+  }
+
+  return questions;
+}
+
+async function validateAndStore(questions, documentId, conceptId) {
+  const rows = questions.map((q) => ({
+    document_id: documentId,
+    concept_id: conceptId,
+    question_text: q.question_text,
+    question_type: q.question_type,
+    answer_choices: q.answer_choices,
+    correct_answer: q.correct_answer,
+    difficulty: q.difficulty,
+    nclex_framework: q.nclex_framework,
+    rationale: q.rationale,
+    trap_explanations: q.trap_explanations,
+    clinical_pearl: q.clinical_pearl,
+  }));
+
+  const { error } = await supabase.from('questions').insert(rows);
+  if (error) throw error;
+
+  const { data: conceptRow } = await supabase
+    .from('concepts')
+    .select('topic_name')
+    .eq('id', conceptId)
+    .maybeSingle();
+
+  const topicLabel = conceptRow?.topic_name ?? conceptId;
+  console.log(`Stored ${rows.length} questions for concept ${topicLabel}`);
+
+  return rows.length;
+}
+
+async function generateQuestions(documentId) {
+  const { data: chunkRows, error: chunkErr } = await supabase
+    .from('document_chunks')
+    .select('chunk_text, chunk_index')
+    .eq('document_id', documentId)
+    .order('chunk_index', { ascending: true });
+
+  if (chunkErr) throw chunkErr;
+
+  const chunks = (chunkRows || []).map((r) => r.chunk_text).filter((t) => typeof t === 'string');
+
+  const concepts = await extractConcepts(documentId, chunks);
+
+  let totalQuestions = 0;
+  const total = concepts.length;
+  const BATCH_SIZE = 5;
+
+  for (let batchStart = 0; batchStart < concepts.length; batchStart += BATCH_SIZE) {
+    const batch = concepts.slice(batchStart, batchStart + BATCH_SIZE);
+
+    const batchCounts = await Promise.all(
+      batch.map((concept, j) => {
+        const globalIndex = batchStart + j;
+        return (async () => {
+          console.log(`[generateQuestions] Concept ${globalIndex + 1}/${total}: ${concept.topic_name}`);
+
+          const relevantChunks = await getRelevantChunks(documentId, concept.topic_name);
+          const questions = await generateQuestionsForConcept(concept, relevantChunks);
+
+          if (!questions.length) {
+            return 0;
+          }
+
+          return validateAndStore(questions, documentId, concept.id);
+        })();
+      })
+    );
+
+    totalQuestions += batchCounts.reduce((sum, n) => sum + n, 0);
+
+    if (batchStart + BATCH_SIZE < concepts.length) {
+      await sleep(3000);
+    }
+  }
+
+  const { error: nullifyErr } = await supabase
+    .from('questions')
+    .update({ concept_id: null })
+    .eq('document_id', documentId);
+  if (nullifyErr) throw nullifyErr;
+
+  const { error: delChunksErr } = await supabase
+    .from('document_chunks')
+    .delete()
+    .eq('document_id', documentId);
+  if (delChunksErr) throw delChunksErr;
+
+  const { error: delConceptsErr } = await supabase
+    .from('concepts')
+    .delete()
+    .eq('document_id', documentId);
+  if (delConceptsErr) throw delConceptsErr;
+
+  console.log('Cleanup complete');
+
+  console.log(`Question generation complete! Total concepts: ${concepts.length}`);
+  return totalQuestions;
+}
+
+module.exports = {
+  generateQuestions,
+};
