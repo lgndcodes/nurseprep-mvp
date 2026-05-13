@@ -14,8 +14,10 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey, {
     autoRefreshToken: false,
     persistSession: false,
   },
-  db: {
-    schema: 'public',
+  realtime: {
+    params: {
+      eventsPerSecond: -1,
+    },
   },
   global: {
     headers: {
