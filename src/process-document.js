@@ -58,7 +58,7 @@ async function processDocument(documentId) {
     const { storage_path: storagePath, filename } = doc;
     console.log(`Found document: ${filename}`);
 
-    console.log('Attempting to download from path:', storagePath);
+    console.log('Downloading from bucket: documents, path:', JSON.stringify(storagePath));
 
     const { data: fileBlob, error: downloadError } = await supabase.storage
       .from('documents')
