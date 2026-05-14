@@ -28,6 +28,10 @@ app.get('/health', (req, res) => {
 
 app.post('/process-document', requireApiKey, async (req, res) => {
   const { document_id } = req.body;
+  console.log('Raw request body:', JSON.stringify(req.body));
+  console.log('document_id type:', typeof document_id);
+  console.log('document_id value:', JSON.stringify(document_id));
+  console.log('document_id length:', document_id ? document_id.length : 'null');
   if (!document_id) {
     return res.status(400).json({ error: 'document_id is required' });
   }
