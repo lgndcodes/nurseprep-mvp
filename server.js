@@ -32,6 +32,8 @@ app.post('/process-document', requireApiKey, async (req, res) => {
   console.log('document_id type:', typeof document_id);
   console.log('document_id value:', JSON.stringify(document_id));
   console.log('document_id length:', document_id ? document_id.length : 'null');
+  console.log('SUPABASE_URL:', JSON.stringify(process.env.SUPABASE_URL));
+  console.log('SUPABASE_SERVICE_KEY first 20 chars:', process.env.SUPABASE_SERVICE_KEY ? process.env.SUPABASE_SERVICE_KEY.substring(0, 20) : 'MISSING');
   if (!document_id) {
     return res.status(400).json({ error: 'document_id is required' });
   }
