@@ -114,6 +114,7 @@ Requirements:
 - Use realistic patient scenarios with clinical context where appropriate.
 - For EACH question in the same response: write the question, full rationales, and self-review quality (quality_passes).
 - Use ONLY information from the provided material.
+- IMPORTANT: Vary the correct answer letter unpredictably across questions. Avoid patterns where the same letter (especially B) is correct more than once in a row or dominates the question set. A student should not be able to guess above 30% by always selecting the same letter. The correct answer should feel genuinely random in its placement.
 
 Return ONLY a JSON array of exactly 3 objects. Each object must have ALL of these fields:
 - question_text (string)
