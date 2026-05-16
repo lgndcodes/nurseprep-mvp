@@ -3,7 +3,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@/hooks/useAuth";
 import { supabase } from "@/lib/supabase";
 import { Loader2, Brain, CheckCircle2, XCircle } from "lucide-react";
-import ReactMarkdown from "react-markdown";
 import {
   Accordion,
   AccordionContent,
@@ -44,6 +43,14 @@ interface QuizRecord {
   correct: boolean;
   question: Question;
   choices: AnswerChoice[];
+}
+
+interface AIReviewData {
+  overall: string;
+  strong_areas: string[];
+  weak_areas: string[];
+  focus_tips: { topic: string; tip: string }[];
+  next_steps: string;
 }
 
 interface TopicStat {
@@ -759,15 +766,13 @@ function AIReview({
   byTopic: TopicStat[];
 }) {
   const [isLoading, setIsLoading] = useState(true);
-  const [review, setReview] = useState<string | null>(null);
+  const [review, setReview] = useState<AIReviewData | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
-  // Track mounted state to prevent state updates after unmount
+  // Prevent setState calls after unmount
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
+    return () => { mountedRef.current = false; };
   }, []);
 
   const fetchReview = useCallback(async () => {
@@ -778,24 +783,16 @@ function AIReview({
 
     // Always wrapped in try/catch — AI review failure must never crash the page
     try {
-      const strongTopics = byTopic
-        .filter((t) => t.pct >= 70)
-        .map((t) => t.topic);
-      const weakTopics = byTopic
-        .filter((t) => t.pct < 70)
-        .map((t) => t.topic);
-      const scoresByTopic: Record<string, { correct: number; total: number }> =
-        {};
+      const strongTopics = byTopic.filter((t) => t.pct >= 70).map((t) => t.topic);
+      const weakTopics   = byTopic.filter((t) => t.pct  < 70).map((t) => t.topic);
+      const scoresByTopic: Record<string, { correct: number; total: number }> = {};
       for (const t of byTopic) {
         scoresByTopic[t.topic] = { correct: t.correct, total: t.total };
       }
 
       const response = await fetch(`${API_BASE}/ai-review`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": API_KEY,
-        },
+        headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
         body: JSON.stringify({
           total_score: pct,
           strong_topics: strongTopics,
@@ -804,43 +801,28 @@ function AIReview({
         }),
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
       const data = await response.json();
-      if (!data.review) {
-        throw new Error("No review in response");
-      }
+      if (!data.review) throw new Error("No review in response");
 
-      if (mountedRef.current) {
-        setReview(data.review);
-      }
+      if (mountedRef.current) setReview(data.review as AIReviewData);
     } catch (err) {
-      if (mountedRef.current) {
-        setReviewError(
-          err instanceof Error ? err.message : "Unknown error"
-        );
-      }
+      if (mountedRef.current)
+        setReviewError(err instanceof Error ? err.message : "Unknown error");
     } finally {
-      if (mountedRef.current) {
-        setIsLoading(false);
-      }
+      if (mountedRef.current) setIsLoading(false);
     }
   }, [pct, byTopic]);
 
-  useEffect(() => {
-    fetchReview();
-  }, [fetchReview]);
-
-  const weakTopics = byTopic.filter((t) => t.pct < 70).map((t) => t.topic);
-  const strongTopics = byTopic.filter((t) => t.pct >= 70).map((t) => t.topic);
+  useEffect(() => { fetchReview(); }, [fetchReview]);
 
   return (
     <div
       className="mt-6 rounded-2xl border-l-4 p-8"
       style={{ backgroundColor: "#E8F8F5", borderLeftColor: "#2DD4BF" }}
     >
+      {/* Header */}
       <div className="flex items-center gap-3">
         <div
           className="flex h-10 w-10 items-center justify-center rounded-full text-white"
@@ -853,93 +835,120 @@ function AIReview({
         </h2>
       </div>
 
-      {(weakTopics.length > 0 || strongTopics.length > 0) && (
-        <div className="mt-6 space-y-4">
-          {weakTopics.length > 0 && (
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Focus Areas
-              </p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {weakTopics.map((t) => (
-                  <span
-                    key={t}
-                    className="rounded-full bg-rose-100 px-3 py-1 text-xs font-medium text-rose-700"
-                  >
-                    {t}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-          {strongTopics.length > 0 && (
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Strong Areas
-              </p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {strongTopics.map((t) => (
-                  <span
-                    key={t}
-                    className="rounded-full px-3 py-1 text-xs font-medium"
-                    style={{ backgroundColor: "#CCF5EC", color: "#0F766E" }}
-                  >
-                    {t}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
+      {/* Loading */}
+      {isLoading && (
+        <div className="mt-6 flex items-center gap-2 text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Getting your personalized feedback…
         </div>
       )}
 
-      <div className="mt-6 text-[15px] leading-7 text-foreground">
-        {isLoading && (
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Getting your personalized feedback…
-          </div>
-        )}
-
-        {!isLoading && reviewError && (
-          <div className="space-y-3">
-            <p className="text-muted-foreground">
-              Could not load AI feedback. Check your connection and try again.
-            </p>
-            <button
-              type="button"
-              onClick={fetchReview}
-              className="rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:opacity-90"
-            >
-              Retry
-            </button>
-          </div>
-        )}
-
-        {!isLoading && !reviewError && review && (
-          <ReactMarkdown
-            components={{
-              p: ({ children }) => (
-                <p className="mb-3 last:mb-0">{children}</p>
-              ),
-              strong: ({ children }) => (
-                <strong className="font-semibold text-primary">
-                  {children}
-                </strong>
-              ),
-              ul: ({ children }) => (
-                <ul className="mb-3 list-disc space-y-1 pl-5">{children}</ul>
-              ),
-              ol: ({ children }) => (
-                <ol className="mb-3 list-decimal space-y-1 pl-5">{children}</ol>
-              ),
-              li: ({ children }) => <li>{children}</li>,
-            }}
+      {/* Error */}
+      {!isLoading && reviewError && (
+        <div className="mt-6 space-y-3">
+          <p className="text-muted-foreground">
+            Could not load AI feedback. Check your connection and try again.
+          </p>
+          <button
+            type="button"
+            onClick={fetchReview}
+            className="rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:opacity-90"
           >
-            {review}
-          </ReactMarkdown>
-        )}
-      </div>
+            Retry
+          </button>
+        </div>
+      )}
+
+      {/* Structured review */}
+      {!isLoading && !reviewError && review && (
+        <div className="mt-6 space-y-6">
+
+          {/* Overall */}
+          {review.overall && (
+            <p className="text-lg font-medium leading-relaxed text-foreground">
+              {review.overall}
+            </p>
+          )}
+
+          {/* Strong / Weak area badges */}
+          {(review.weak_areas?.length > 0 || review.strong_areas?.length > 0) && (
+            <div className="space-y-4">
+              {review.weak_areas?.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    Focus Areas
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {review.weak_areas.map((t) => (
+                      <span
+                        key={t}
+                        className="rounded-full bg-rose-100 px-3 py-1 text-xs font-medium text-rose-700"
+                      >
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {review.strong_areas?.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    Strong Areas
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {review.strong_areas.map((t) => (
+                      <span
+                        key={t}
+                        className="rounded-full px-3 py-1 text-xs font-medium"
+                        style={{ backgroundColor: "#CCF5EC", color: "#0F766E" }}
+                      >
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Focus tips — one card per topic */}
+          {review.focus_tips?.length > 0 && (
+            <div className="space-y-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Study Tips
+              </p>
+              {review.focus_tips.map((ft) => (
+                <div
+                  key={ft.topic}
+                  className="rounded-xl border border-border bg-white px-5 py-4"
+                >
+                  <p className="text-sm font-semibold text-foreground">{ft.topic}</p>
+                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+                    {ft.tip}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Next steps — highlighted teal box */}
+          {review.next_steps && (
+            <div
+              className="rounded-xl px-5 py-4"
+              style={{ backgroundColor: "#2DD4BF1A", border: "1px solid #2DD4BF66" }}
+            >
+              <p className="text-xs font-semibold uppercase tracking-wide"
+                 style={{ color: "#0F766E" }}>
+                Next Steps
+              </p>
+              <p className="mt-1 text-sm font-medium leading-relaxed text-foreground">
+                {review.next_steps}
+              </p>
+            </div>
+          )}
+
+        </div>
+      )}
     </div>
   );
 }
