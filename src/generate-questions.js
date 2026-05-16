@@ -94,6 +94,72 @@ async function getRelevantChunks(documentId, topicName) {
   return data.map((row) => row.chunk_text ?? row.content ?? '').filter(Boolean);
 }
 
+/**
+ * Post-processing guard: if more than 2 out of 3 MCQ questions share the same
+ * correct_answer letter, swap the answer choices on the repeated questions so the
+ * correct answer lands on a different letter.  SATA questions are left untouched.
+ */
+function redistributeAnswers(questions) {
+  const LETTERS = ['A', 'B', 'C', 'D'];
+
+  // Count correct_answer occurrences across MCQ questions only
+  const counts = {};
+  for (const q of questions) {
+    if (q.question_type === 'sata') continue;
+    const ca = (q.correct_answer || '').toUpperCase();
+    counts[ca] = (counts[ca] || 0) + 1;
+  }
+
+  // Only intervene when a single letter dominates more than 2 of the 3 questions
+  const biasedLetter = Object.keys(counts).find((l) => counts[l] > 2);
+  if (!biasedLetter) return questions;
+
+  const replacements = LETTERS.filter((l) => l !== biasedLetter);
+  let replacementIdx = 0;
+  let firstSeen = false;
+
+  return questions.map((q) => {
+    if (q.question_type === 'sata' || q.correct_answer !== biasedLetter) return q;
+
+    // Keep the first occurrence of the biased letter unchanged
+    if (!firstSeen) {
+      firstSeen = true;
+      return q;
+    }
+
+    // Pick the next replacement letter (cycle through A/B/C/D minus the biased one)
+    const newLetter = replacements[replacementIdx % replacements.length];
+    replacementIdx += 1;
+
+    const choices = Array.isArray(q.answer_choices) ? q.answer_choices : [];
+    const correctChoice = choices.find((c) => c.letter === biasedLetter);
+    const swapChoice    = choices.find((c) => c.letter === newLetter);
+    if (!correctChoice || !swapChoice) return q;
+
+    // Swap the two letter labels; keep all other content intact
+    const newChoices = choices
+      .map((c) => {
+        if (c.letter === biasedLetter) return { ...c, letter: newLetter };
+        if (c.letter === newLetter)    return { ...c, letter: biasedLetter };
+        return c;
+      })
+      .sort((a, b) => a.letter.localeCompare(b.letter));
+
+    // Remap trap_explanations keys to match the swapped letters
+    const oldTraps = q.trap_explanations || {};
+    const newTraps = {};
+    for (const [k, v] of Object.entries(oldTraps)) {
+      if (k === biasedLetter)     newTraps[newLetter]     = v;
+      else if (k === newLetter)   newTraps[biasedLetter]  = v;
+      else                        newTraps[k]             = v;
+    }
+
+    console.log(`[redistributeAnswers] Moved correct answer ${biasedLetter}→${newLetter} for bias correction`);
+
+    return { ...q, answer_choices: newChoices, correct_answer: newLetter, trap_explanations: newTraps };
+  });
+}
+
 async function generateQuestionsForConcept(concept, relevantChunks) {
   const context = relevantChunks.length
     ? relevantChunks.join('\n\n---\n\n')
@@ -166,7 +232,7 @@ ${context}`,
     return [];
   }
 
-  return questions;
+  return redistributeAnswers(questions);
 }
 
 async function validateAndStore(questions, documentId, conceptId) {

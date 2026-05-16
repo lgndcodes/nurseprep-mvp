@@ -59,20 +59,41 @@ app.post('/ai-review', requireApiKey, async (req, res) => {
   try {
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
-      max_tokens: 300,
-      system: 'You are an encouraging nursing education coach. Give honest, specific, actionable study feedback.',
+      max_tokens: 600,
+      system: 'You are an encouraging nursing education coach. Give honest, specific, actionable study feedback. Always respond with valid JSON only — no prose, no markdown, no code fences.',
       messages: [
         {
           role: 'user',
-          content: `A nursing student scored ${total_score}%. Strong topics: ${strongList}. Weak topics: ${weakList}. Write 3-4 encouraging but honest sentences about what to study next.`,
+          content: `A nursing student scored ${total_score}%. Strong topics: ${strongList}. Weak topics: ${weakList}.
+
+Return ONLY this JSON structure (no other text):
+{
+  "overall": "one encouraging sentence about overall performance",
+  "strong_areas": ["topic 1", "topic 2"],
+  "weak_areas": ["topic 1", "topic 2"],
+  "focus_tips": [
+    { "topic": "topic name", "tip": "specific 1 sentence study tip for this topic" }
+  ],
+  "next_steps": "one specific actionable sentence about what to study next"
+}`,
         },
       ],
     });
 
-    const review = message.content
+    const raw = message.content
       .filter((b) => b.type === 'text')
       .map((b) => b.text)
       .join('');
+
+    let review;
+    try {
+      review = JSON.parse(raw.replace(/```json\n?|```\n?/g, '').trim());
+    } catch {
+      // If Claude doesn't return valid JSON, surface the raw text so the client
+      // still gets something useful rather than a silent 500
+      console.warn('ai-review: Claude response was not valid JSON, returning raw text');
+      review = { overall: raw, strong_areas: [], weak_areas: [], focus_tips: [], next_steps: '' };
+    }
 
     res.json({ review });
   } catch (error) {
