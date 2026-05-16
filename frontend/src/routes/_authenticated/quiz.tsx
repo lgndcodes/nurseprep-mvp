@@ -69,6 +69,14 @@ interface PersistedResults {
   completedAt: string;
 }
 
+interface SavedProgress {
+  currentIndex: number;
+  answers: QuizRecord[];
+  documentId: string;
+  totalQuestions: number;
+  savedAt: string;
+}
+
 // ─── Route ────────────────────────────────────────────────────────────────────
 
 export const Route = createFileRoute("/_authenticated/quiz")({
@@ -117,10 +125,98 @@ function saveResultsToLocalStorage(payload: PersistedResults): void {
 function loadResultsFromLocalStorage(): PersistedResults | null {
   try {
     const raw = localStorage.getItem(LS_KEY);
-    return raw ? (JSON.parse(raw) as PersistedResults) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PersistedResults;
+    // Validate shape before returning
+    if (!Array.isArray(parsed?.records)) return null;
+    return parsed;
   } catch {
     return null;
   }
+}
+
+function progressKey(documentId: string): string {
+  return `quiz_progress_${documentId}`;
+}
+
+function saveProgressToLocalStorage(
+  documentId: string,
+  currentIndex: number,
+  answers: QuizRecord[],
+  totalQuestions: number
+): void {
+  try {
+    const payload: SavedProgress = {
+      currentIndex,
+      answers,
+      documentId,
+      totalQuestions,
+      savedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(progressKey(documentId), JSON.stringify(payload));
+  } catch {
+    // Ignore quota errors
+  }
+}
+
+function loadProgressFromLocalStorage(documentId: string): SavedProgress | null {
+  try {
+    const raw = localStorage.getItem(progressKey(documentId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as SavedProgress;
+    if (!Array.isArray(parsed?.answers)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function clearProgressFromLocalStorage(documentId: string): void {
+  try {
+    localStorage.removeItem(progressKey(documentId));
+  } catch {
+    // Ignore
+  }
+}
+
+// ─── Resume Modal ─────────────────────────────────────────────────────────────
+
+function ResumeModal({
+  savedProgress,
+  onResume,
+  onStartOver,
+}: {
+  savedProgress: SavedProgress;
+  onResume: () => void;
+  onStartOver: () => void;
+}) {
+  const questionNum = savedProgress.currentIndex + 1;
+  const total = savedProgress.totalQuestions;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+      <div className="w-full max-w-sm rounded-2xl border border-border bg-card p-8 shadow-xl">
+        <h2 className="text-xl font-semibold tracking-tight">Resume quiz?</h2>
+        <p className="mt-3 text-muted-foreground">
+          You were on question {questionNum} of {total}. Resume where you left
+          off, or start a fresh session?
+        </p>
+        <div className="mt-6 flex flex-col gap-3">
+          <button
+            onClick={onResume}
+            className="rounded-lg bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+          >
+            Resume — question {questionNum} of {total}
+          </button>
+          <button
+            onClick={onStartOver}
+            className="rounded-lg border border-border bg-background px-5 py-3 text-sm font-semibold transition-colors hover:bg-muted"
+          >
+            Start over
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ─── Main quiz page ───────────────────────────────────────────────────────────
@@ -150,6 +246,10 @@ function QuizPage() {
   // Ref to always have the latest records without stale closure issues
   const recordsRef = useRef<QuizRecord[]>([]);
 
+  // Resume modal state
+  const [savedProgress, setSavedProgress] = useState<SavedProgress | null>(null);
+  const [showResumeModal, setShowResumeModal] = useState(false);
+
   // Fetch questions on mount
   useEffect(() => {
     if (!documentId) {
@@ -166,11 +266,49 @@ function QuizPage() {
         .eq("document_id", documentId);
       if (err) {
         setError(err.message);
-      } else {
-        setQuestions(shuffle(data ?? []));
+        setLoading(false);
+        return;
       }
+      const fetched = shuffle(data ?? []);
+      setQuestions(fetched);
+
+      // Check for saved progress after questions are loaded
+      const progress = loadProgressFromLocalStorage(documentId);
+      if (
+        progress &&
+        progress.currentIndex < fetched.length - 1 &&
+        progress.answers.length > 0
+      ) {
+        setSavedProgress(progress);
+        setShowResumeModal(true);
+      }
+
       setLoading(false);
     })();
+  }, [documentId]);
+
+  const handleResume = useCallback(() => {
+    if (!savedProgress) return;
+    setShowResumeModal(false);
+    // Restore state from saved progress
+    recordsRef.current = savedProgress.answers;
+    setRecords(savedProgress.answers);
+    setCurrentIndex(savedProgress.currentIndex);
+    setPhase("answering");
+    setSelected(null);
+    setSataSelected([]);
+  }, [savedProgress]);
+
+  const handleStartOver = useCallback(() => {
+    if (documentId) clearProgressFromLocalStorage(documentId);
+    setShowResumeModal(false);
+    setSavedProgress(null);
+    setCurrentIndex(0);
+    recordsRef.current = [];
+    setRecords([]);
+    setSelected(null);
+    setSataSelected([]);
+    setPhase("answering");
   }, [documentId]);
 
   const question = questions[currentIndex];
@@ -212,6 +350,16 @@ function QuizPage() {
     recordsRef.current = updatedRecords;
     setRecords(updatedRecords);
     setPhase("reviewing");
+
+    // Save progress after every answer
+    if (documentId) {
+      saveProgressToLocalStorage(
+        documentId,
+        currentIndex,
+        updatedRecords,
+        questions.length
+      );
+    }
 
     // Fire-and-forget Supabase analytics (non-blocking, non-crashing)
     if (user) {
@@ -297,6 +445,10 @@ function QuizPage() {
         completedAt: new Date().toISOString(),
       };
       saveResultsToLocalStorage(payload);
+
+      // Clear in-progress save now that the quiz is complete
+      if (documentId) clearProgressFromLocalStorage(documentId);
+
       setPhase("complete");
     } else {
       setCurrentIndex((i) => i + 1);
@@ -304,10 +456,11 @@ function QuizPage() {
       setSataSelected([]);
       setPhase("answering");
     }
-  }, [currentIndex, questions.length]);
+  }, [currentIndex, questions.length, documentId]);
 
   // Restart quiz with reshuffled questions
   const handleAnother = () => {
+    if (documentId) clearProgressFromLocalStorage(documentId);
     recordsRef.current = [];
     setRecords([]);
     setQuestions((q) => shuffle(q));
@@ -354,6 +507,23 @@ function QuizPage() {
         onAnother={handleAnother}
         onDashboard={() => navigate({ to: "/dashboard" })}
       />
+    );
+  }
+
+  // ── Render: resume modal overlay ──
+  if (showResumeModal && savedProgress) {
+    return (
+      <>
+        <ResumeModal
+          savedProgress={savedProgress}
+          onResume={handleResume}
+          onStartOver={handleStartOver}
+        />
+        {/* Blurred quiz placeholder behind modal */}
+        <main className="mx-auto max-w-3xl px-6 py-12 opacity-30 pointer-events-none select-none">
+          <p className="text-muted-foreground">Loading quiz…</p>
+        </main>
+      </>
     );
   }
 
@@ -484,8 +654,8 @@ function AnswerReview({
   const trapExplanations = question.trap_explanations ?? {};
 
   const formatAnswer = (ids: string) =>
-    choices
-      .filter((c) => ids.split(",").includes(c.id))
+    (choices ?? [])
+      .filter((c) => (ids ?? "").split(",").includes(c.id))
       .map((c) => `${c.id}. ${c.text}`)
       .join("  •  ") || ids;
 
@@ -526,7 +696,7 @@ function AnswerReview({
             Why the wrong answers are tempting
           </h3>
           <ul className="mt-3 space-y-3">
-            {choices
+            {(choices ?? [])
               .filter(
                 (c) =>
                   c.id !== question.correct_answer && trapExplanations[c.id]
@@ -591,14 +761,16 @@ function QuizResults({
 }) {
   // Fallback: if records are empty (e.g. after a page refresh), read from localStorage
   const persisted = useMemo<PersistedResults | null>(() => {
-    if (propRecords.length > 0) return null;
+    if ((propRecords ?? []).length > 0) return null;
     return loadResultsFromLocalStorage();
-  }, [propRecords.length]);
+  }, [(propRecords ?? []).length]);
 
-  const records = propRecords.length > 0 ? propRecords : (persisted?.records ?? []);
-  const total = propRecords.length > 0 ? propTotal : (persisted?.total ?? propTotal);
+  const records: QuizRecord[] = (propRecords ?? []).length > 0
+    ? propRecords
+    : (persisted?.records ?? []);
+  const total = (propRecords ?? []).length > 0 ? propTotal : (persisted?.total ?? propTotal);
 
-  const correctCount = records.filter((r) => r.correct).length;
+  const correctCount = records.filter((r) => r?.correct).length;
   const score = total > 0 ? Math.round((correctCount / total) * 100) : 0;
 
   const byTopic: TopicStat[] = useMemo(() => {
@@ -607,6 +779,7 @@ function QuizResults({
       { correct: number; total: number; items: QuizRecord[] }
     >();
     for (const rec of records) {
+      if (!rec) continue;
       const entry = topicMap.get(rec.framework) ?? {
         correct: 0,
         total: 0,
@@ -627,10 +800,10 @@ function QuizResults({
   }, [records]);
 
   const formatAnswer = (ids: string, choices: AnswerChoice[]) =>
-    choices
-      .filter((c) => ids.split(",").includes(c.id))
+    (choices ?? [])
+      .filter((c) => (ids ?? "").split(",").includes(c.id))
       .map((c) => `${c.id}. ${c.text}`)
-      .join("  •  ") || ids;
+      .join("  •  ") || (ids ?? "");
 
   return (
     <main className="mx-auto max-w-3xl px-4 py-12 sm:px-6">
@@ -661,6 +834,7 @@ function QuizResults({
             className="mt-4 divide-y divide-border rounded-2xl border border-border bg-card"
           >
             {byTopic.map((stat) => {
+              if (!stat) return null;
               const isBelowThreshold = stat.pct < 70;
               return (
                 <AccordionItem
@@ -686,49 +860,52 @@ function QuizResults({
                   </AccordionTrigger>
                   <AccordionContent>
                     <ul className="space-y-4 pb-2">
-                      {stat.items.map((rec) => (
-                        <li
-                          key={rec.questionId}
-                          className="rounded-lg border border-border bg-background p-4"
-                        >
-                          <div className="flex items-start gap-2">
-                            {rec.correct ? (
-                              <CheckCircle2 className="mt-0.5 h-5 w-5 flex-none text-emerald-600" />
-                            ) : (
-                              <XCircle className="mt-0.5 h-5 w-5 flex-none text-destructive" />
+                      {(stat.items ?? []).map((rec) => {
+                        if (!rec || !rec.question) return null;
+                        return (
+                          <li
+                            key={rec.questionId}
+                            className="rounded-lg border border-border bg-background p-4"
+                          >
+                            <div className="flex items-start gap-2">
+                              {rec.correct ? (
+                                <CheckCircle2 className="mt-0.5 h-5 w-5 flex-none text-emerald-600" />
+                              ) : (
+                                <XCircle className="mt-0.5 h-5 w-5 flex-none text-destructive" />
+                              )}
+                              <p className="text-sm font-medium leading-snug">
+                                {rec.question.question_text ?? ""}
+                              </p>
+                            </div>
+                            <dl className="mt-3 space-y-1.5 pl-7 text-sm">
+                              <div>
+                                <dt className="inline text-muted-foreground">
+                                  Your answer:{" "}
+                                </dt>
+                                <dd className="inline font-medium">
+                                  {formatAnswer(rec.selected ?? "", rec.choices ?? [])}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="inline text-muted-foreground">
+                                  Correct answer:{" "}
+                                </dt>
+                                <dd className="inline font-medium">
+                                  {formatAnswer(
+                                    rec.question.correct_answer ?? "",
+                                    rec.choices ?? []
+                                  )}
+                                </dd>
+                              </div>
+                            </dl>
+                            {rec.question.rationale && (
+                              <p className="mt-3 pl-7 text-sm leading-relaxed text-muted-foreground">
+                                {rec.question.rationale}
+                              </p>
                             )}
-                            <p className="text-sm font-medium leading-snug">
-                              {rec.question.question_text}
-                            </p>
-                          </div>
-                          <dl className="mt-3 space-y-1.5 pl-7 text-sm">
-                            <div>
-                              <dt className="inline text-muted-foreground">
-                                Your answer:{" "}
-                              </dt>
-                              <dd className="inline font-medium">
-                                {formatAnswer(rec.selected, rec.choices)}
-                              </dd>
-                            </div>
-                            <div>
-                              <dt className="inline text-muted-foreground">
-                                Correct answer:{" "}
-                              </dt>
-                              <dd className="inline font-medium">
-                                {formatAnswer(
-                                  rec.question.correct_answer ?? "",
-                                  rec.choices
-                                )}
-                              </dd>
-                            </div>
-                          </dl>
-                          {rec.question.rationale && (
-                            <p className="mt-3 pl-7 text-sm leading-relaxed text-muted-foreground">
-                              {rec.question.rationale}
-                            </p>
-                          )}
-                        </li>
-                      ))}
+                          </li>
+                        );
+                      })}
                     </ul>
                   </AccordionContent>
                 </AccordionItem>
@@ -775,6 +952,8 @@ function AIReview({
     return () => { mountedRef.current = false; };
   }, []);
 
+  const safeByTopic = Array.isArray(byTopic) ? byTopic : [];
+
   const fetchReview = useCallback(async () => {
     if (!mountedRef.current) return;
     setIsLoading(true);
@@ -783,10 +962,10 @@ function AIReview({
 
     // Always wrapped in try/catch — AI review failure must never crash the page
     try {
-      const strongTopics = byTopic.filter((t) => t.pct >= 70).map((t) => t.topic);
-      const weakTopics   = byTopic.filter((t) => t.pct  < 70).map((t) => t.topic);
+      const strongTopics = safeByTopic.filter((t) => t.pct >= 70).map((t) => t.topic);
+      const weakTopics   = safeByTopic.filter((t) => t.pct  < 70).map((t) => t.topic);
       const scoresByTopic: Record<string, { correct: number; total: number }> = {};
-      for (const t of byTopic) {
+      for (const t of safeByTopic) {
         scoresByTopic[t.topic] = { correct: t.correct, total: t.total };
       }
 
@@ -806,16 +985,27 @@ function AIReview({
       const data = await response.json();
       if (!data.review) throw new Error("No review in response");
 
-      if (mountedRef.current) setReview(data.review as AIReviewData);
+      // Ensure review is an object (not a stringified JSON string)
+      const reviewData: AIReviewData =
+        typeof data.review === "string"
+          ? (JSON.parse(data.review) as AIReviewData)
+          : (data.review as AIReviewData);
+
+      if (mountedRef.current) setReview(reviewData);
     } catch (err) {
       if (mountedRef.current)
         setReviewError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       if (mountedRef.current) setIsLoading(false);
     }
-  }, [pct, byTopic]);
+  }, [pct, safeByTopic]);
 
   useEffect(() => { fetchReview(); }, [fetchReview]);
+
+  // Safe accessors for potentially partial API responses
+  const weakAreas: string[] = Array.isArray(review?.weak_areas) ? review!.weak_areas : [];
+  const strongAreas: string[] = Array.isArray(review?.strong_areas) ? review!.strong_areas : [];
+  const focusTips: { topic: string; tip: string }[] = Array.isArray(review?.focus_tips) ? review!.focus_tips : [];
 
   return (
     <div
@@ -871,15 +1061,15 @@ function AIReview({
           )}
 
           {/* Strong / Weak area badges */}
-          {(review.weak_areas?.length > 0 || review.strong_areas?.length > 0) && (
+          {(weakAreas.length > 0 || strongAreas.length > 0) && (
             <div className="space-y-4">
-              {review.weak_areas?.length > 0 && (
+              {weakAreas.length > 0 && (
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                     Focus Areas
                   </p>
                   <div className="mt-2 flex flex-wrap gap-2">
-                    {review.weak_areas.map((t) => (
+                    {weakAreas.map((t) => (
                       <span
                         key={t}
                         className="rounded-full bg-rose-100 px-3 py-1 text-xs font-medium text-rose-700"
@@ -890,13 +1080,13 @@ function AIReview({
                   </div>
                 </div>
               )}
-              {review.strong_areas?.length > 0 && (
+              {strongAreas.length > 0 && (
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                     Strong Areas
                   </p>
                   <div className="mt-2 flex flex-wrap gap-2">
-                    {review.strong_areas.map((t) => (
+                    {strongAreas.map((t) => (
                       <span
                         key={t}
                         className="rounded-full px-3 py-1 text-xs font-medium"
@@ -912,19 +1102,19 @@ function AIReview({
           )}
 
           {/* Focus tips — one card per topic */}
-          {review.focus_tips?.length > 0 && (
+          {focusTips.length > 0 && (
             <div className="space-y-3">
               <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 Study Tips
               </p>
-              {review.focus_tips.map((ft) => (
+              {focusTips.map((ft) => (
                 <div
                   key={ft.topic}
                   className="rounded-xl border border-border bg-white px-5 py-4"
                 >
-                  <p className="text-sm font-semibold text-foreground">{ft.topic}</p>
+                  <p className="text-sm font-semibold text-foreground">{ft.topic ?? ""}</p>
                   <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-                    {ft.tip}
+                    {ft.tip ?? ""}
                   </p>
                 </div>
               ))}
