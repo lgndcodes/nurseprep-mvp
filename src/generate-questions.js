@@ -277,15 +277,32 @@ async function validateAndStore(questions, documentId, conceptId) {
  * @param {string}   documentId
  * @param {object[]} concepts      - subset to process
  * @param {object}   opts
- * @param {number}   opts.logOffset  - display index offset (for logging)
- * @param {number}   opts.logTotal   - total concept count shown in logs
+ * @param {number}   opts.logOffset         - display index offset (for logging)
+ * @param {number}   opts.logTotal           - total concept count shown in logs
+ * @param {number|null} opts.questionCountLimit - stop early once this many
+ *                                               questions are already stored
  */
-async function processConcepts(documentId, concepts, { logOffset = 0, logTotal = null } = {}) {
+async function processConcepts(documentId, concepts, { logOffset = 0, logTotal = null, questionCountLimit = null } = {}) {
   const displayTotal = logTotal ?? concepts.length;
   const BATCH_SIZE = 5;
   let totalQuestions = 0;
 
   for (let batchStart = 0; batchStart < concepts.length; batchStart += BATCH_SIZE) {
+    // ── Early-exit check before each batch ──────────────────────────────────
+    if (questionCountLimit !== null) {
+      const { count, error: countErr } = await supabase
+        .from('questions')
+        .select('id', { count: 'exact', head: true })
+        .eq('document_id', documentId);
+
+      if (countErr) {
+        console.error('[background] Could not check question count:', countErr);
+      } else if (count >= questionCountLimit) {
+        console.log(`Question limit reached (${count}/${questionCountLimit}), stopping background generation`);
+        break;
+      }
+    }
+
     const batch = concepts.slice(batchStart, batchStart + BATCH_SIZE);
 
     const batchCounts = await Promise.all(
@@ -440,6 +457,7 @@ async function generateQuestions(documentId, questionCount = null) {
       const remainingTotal = await processConcepts(documentId, remainingConcepts, {
         logOffset: priorityCount,
         logTotal: totalConcepts,
+        questionCountLimit: questionCount,   // null when no limit was requested
       });
       await cleanup(documentId);
       console.log(`Full generation complete. Total questions: ${priorityTotal + remainingTotal}`);
