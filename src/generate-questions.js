@@ -209,8 +209,12 @@ ${context}`,
       const isRateLimit =
         err instanceof Anthropic.RateLimitError || err?.status === 429;
       if (isRateLimit && rateAttempt === 0) {
-        console.log('Rate limit hit - waiting 60 seconds before retry...');
-        await sleep(60000);
+        // Honour the API's own retry-after header; fall back to 60 s
+        const rawHeader = err.headers?.['retry-after'];
+        const retryAfterSec = rawHeader ? Math.ceil(Number(rawHeader)) : 60;
+        const waitMs = (Number.isFinite(retryAfterSec) ? retryAfterSec : 60) * 1000;
+        console.log(`Rate limit hit - waiting ${waitMs / 1000}s before retry...`);
+        await sleep(waitMs);
         continue;
       }
       throw err;
@@ -265,51 +269,52 @@ async function validateAndStore(questions, documentId, conceptId) {
   return rows.length;
 }
 
-async function generateQuestions(documentId) {
-  const { data: chunkRows, error: chunkErr } = await supabase
-    .from('document_chunks')
-    .select('chunk_text, chunk_index')
-    .eq('document_id', documentId)
-    .order('chunk_index', { ascending: true });
-
-  if (chunkErr) throw chunkErr;
-
-  const chunks = (chunkRows || []).map((r) => r.chunk_text).filter((t) => typeof t === 'string');
-
-  const concepts = await extractConcepts(documentId, chunks);
-
-  let totalQuestions = 0;
-  const total = concepts.length;
+/**
+ * Process a slice of concepts in parallel batches of 5 with no artificial
+ * delays.  Rate-limit pauses are handled inside generateQuestionsForConcept
+ * using the API's retry-after header.
+ *
+ * @param {string}   documentId
+ * @param {object[]} concepts      - subset to process
+ * @param {object}   opts
+ * @param {number}   opts.logOffset  - display index offset (for logging)
+ * @param {number}   opts.logTotal   - total concept count shown in logs
+ */
+async function processConcepts(documentId, concepts, { logOffset = 0, logTotal = null } = {}) {
+  const displayTotal = logTotal ?? concepts.length;
   const BATCH_SIZE = 5;
+  let totalQuestions = 0;
 
   for (let batchStart = 0; batchStart < concepts.length; batchStart += BATCH_SIZE) {
     const batch = concepts.slice(batchStart, batchStart + BATCH_SIZE);
 
     const batchCounts = await Promise.all(
       batch.map((concept, j) => {
-        const globalIndex = batchStart + j;
+        const displayIndex = logOffset + batchStart + j + 1;
         return (async () => {
-          console.log(`[generateQuestions] Concept ${globalIndex + 1}/${total}: ${concept.topic_name}`);
+          console.log(`[generateQuestions] Concept ${displayIndex}/${displayTotal}: ${concept.topic_name}`);
 
           const relevantChunks = await getRelevantChunks(documentId, concept.topic_name);
           const questions = await generateQuestionsForConcept(concept, relevantChunks);
 
-          if (!questions.length) {
-            return 0;
-          }
-
+          if (!questions.length) return 0;
           return validateAndStore(questions, documentId, concept.id);
         })();
       })
     );
 
     totalQuestions += batchCounts.reduce((sum, n) => sum + n, 0);
-
-    if (batchStart + BATCH_SIZE < concepts.length) {
-      await sleep(3000);
-    }
+    // No artificial sleep — run at full speed; 429s are handled per-call above
   }
 
+  return totalQuestions;
+}
+
+/**
+ * Nullify concept references on questions and delete transient rows
+ * (document_chunks, concepts) once generation is finished.
+ */
+async function cleanup(documentId) {
   const { error: nullifyErr } = await supabase
     .from('questions')
     .update({ concept_id: null })
@@ -329,9 +334,91 @@ async function generateQuestions(documentId) {
   if (delConceptsErr) throw delConceptsErr;
 
   console.log('Cleanup complete');
+}
 
-  console.log(`Question generation complete! Total concepts: ${concepts.length}`);
-  return totalQuestions;
+/**
+ * Main entry point.
+ *
+ * @param {string}      documentId
+ * @param {number|null} questionCount  - target number of questions.  If null,
+ *                                       all concepts are processed before the
+ *                                       document is marked ready.
+ *
+ * When questionCount is provided:
+ *   1. Process ceil(questionCount/3) highest-importance concepts (priority batch).
+ *   2. Immediately mark the document "ready" so students can start.
+ *   3. Continue generating remaining concepts in the background.
+ *
+ * Returns the number of questions produced by the priority batch so the HTTP
+ * response can acknowledge them quickly.
+ */
+async function generateQuestions(documentId, questionCount = null) {
+  const { data: chunkRows, error: chunkErr } = await supabase
+    .from('document_chunks')
+    .select('chunk_text, chunk_index')
+    .eq('document_id', documentId)
+    .order('chunk_index', { ascending: true });
+
+  if (chunkErr) throw chunkErr;
+
+  const chunks = (chunkRows || []).map((r) => r.chunk_text).filter((t) => typeof t === 'string');
+
+  const concepts = await extractConcepts(documentId, chunks);
+  if (!concepts.length) return 0;
+
+  // Sort highest importance first so the priority batch covers the best material
+  const sorted = [...concepts].sort((a, b) => (b.importance_score ?? 0) - (a.importance_score ?? 0));
+  const totalConcepts = sorted.length;
+
+  // How many concepts to generate before marking "ready"
+  const priorityCount = questionCount
+    ? Math.min(Math.ceil(questionCount / 3), totalConcepts)
+    : totalConcepts;
+
+  const priorityConcepts  = sorted.slice(0, priorityCount);
+  const remainingConcepts = sorted.slice(priorityCount);
+
+  // ── Priority batch ──────────────────────────────────────────────────────────
+  const priorityTotal = await processConcepts(documentId, priorityConcepts, {
+    logOffset: 0,
+    logTotal: totalConcepts,
+  });
+
+  // Mark document ready immediately after priority questions are stored
+  const { error: readyErr } = await supabase
+    .from('documents')
+    .update({ status: 'ready' })
+    .eq('id', documentId);
+  if (readyErr) console.error('Failed to update document status to ready:', readyErr);
+
+  console.log(`Document ready - ${priorityTotal} questions available for student`);
+
+  // ── Remaining concepts (background) ────────────────────────────────────────
+  if (remainingConcepts.length === 0) {
+    await cleanup(documentId);
+    console.log(`Full generation complete. Total questions: ${priorityTotal}`);
+    return priorityTotal;
+  }
+
+  // Fire-and-forget — do NOT await; HTTP response returns immediately after priority batch
+  (async () => {
+    try {
+      const remainingTotal = await processConcepts(documentId, remainingConcepts, {
+        logOffset: priorityCount,
+        logTotal: totalConcepts,
+      });
+      await cleanup(documentId);
+      console.log(`Full generation complete. Total questions: ${priorityTotal + remainingTotal}`);
+    } catch (err) {
+      console.error('[background] Question generation error:', err);
+      // Best-effort cleanup even if generation partially failed
+      try { await cleanup(documentId); } catch (cleanupErr) {
+        console.error('[background] Cleanup also failed:', cleanupErr);
+      }
+    }
+  })();
+
+  return priorityTotal;
 }
 
 module.exports = {

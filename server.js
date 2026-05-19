@@ -103,15 +103,22 @@ Return ONLY this JSON structure (no other text):
 });
 
 app.post('/generate-questions', requireApiKey, async (req, res) => {
-  const { document_id } = req.body;
+  const { document_id, question_count } = req.body;
   if (!document_id) {
     return res.status(400).json({ error: 'document_id is required' });
   }
 
-  console.log(`Generating questions for document: ${document_id}`);
+  // question_count is optional; must be a positive integer when supplied
+  const questionCount =
+    Number.isInteger(question_count) && question_count > 0 ? question_count : null;
+
+  console.log(
+    `Generating questions for document: ${document_id}` +
+    (questionCount ? ` (target: ${questionCount} questions)` : ' (all concepts)')
+  );
 
   try {
-    const result = await generateQuestions(document_id);
+    const result = await generateQuestions(document_id, questionCount);
     res.status(200).json({
       success: true,
       document_id,
