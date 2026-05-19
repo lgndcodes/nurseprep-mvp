@@ -311,6 +311,34 @@ async function processConcepts(documentId, concepts, { logOffset = 0, logTotal =
 }
 
 /**
+ * If more questions than `limit` were stored for this document, delete the
+ * excess rows so the student receives exactly the number they requested.
+ * Rows are ordered by created_at ascending so the oldest (first-inserted)
+ * questions are kept and any overflow from the last concept batch is removed.
+ */
+async function trimToQuestionCount(documentId, limit) {
+  const { data: rows, error: fetchErr } = await supabase
+    .from('questions')
+    .select('id')
+    .eq('document_id', documentId)
+    .order('created_at', { ascending: true });
+
+  if (fetchErr) throw fetchErr;
+  if (!rows || rows.length <= limit) return; // already at or under the target
+
+  const idsToDelete = rows.slice(limit).map((r) => r.id);
+
+  const { error: deleteErr } = await supabase
+    .from('questions')
+    .delete()
+    .in('id', idsToDelete);
+
+  if (deleteErr) throw deleteErr;
+
+  console.log(`Trimmed ${idsToDelete.length} excess questions — kept exactly ${limit}`);
+}
+
+/**
  * Nullify concept references on questions and delete transient rows
  * (document_chunks, concepts) once generation is finished.
  */
@@ -384,14 +412,20 @@ async function generateQuestions(documentId, questionCount = null) {
     logTotal: totalConcepts,
   });
 
-  // Mark document ready immediately after priority questions are stored
+  // ── Trim to exact questionCount if a target was specified ──────────────────
+  if (questionCount) {
+    await trimToQuestionCount(documentId, questionCount);
+  }
+
+  // Mark document ready immediately after priority questions are stored (and trimmed)
   const { error: readyErr } = await supabase
     .from('documents')
     .update({ status: 'ready' })
     .eq('id', documentId);
   if (readyErr) console.error('Failed to update document status to ready:', readyErr);
 
-  console.log(`Document ready - ${priorityTotal} questions available for student`);
+  const readyCount = questionCount ? Math.min(priorityTotal, questionCount) : priorityTotal;
+  console.log(`Document ready - ${readyCount} questions available for student`);
 
   // ── Remaining concepts (background) ────────────────────────────────────────
   if (remainingConcepts.length === 0) {
