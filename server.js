@@ -6,6 +6,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
+const supabase = require('./src/supabase.js');
 const { processDocument } = require('./src/process-document.js');
 const { generateQuestions } = require('./src/generate-questions.js');
 
@@ -103,29 +104,60 @@ Return ONLY this JSON structure (no other text):
 });
 
 app.post('/generate-questions', requireApiKey, async (req, res) => {
-  const { document_id, question_count, quiz_style } = req.body;
+  const { document_id, question_count, quiz_style, quiz_set_label } = req.body;
   if (!document_id) {
     return res.status(400).json({ error: 'document_id is required' });
   }
 
-  // question_count is optional; must be a positive integer when supplied
+  // Default to 20 questions; accept any positive integer override
   const questionCount =
-    Number.isInteger(question_count) && question_count > 0 ? question_count : null;
+    Number.isInteger(question_count) && question_count > 0 ? question_count : 20;
 
-  // quiz_style defaults to 'nclex'; only 'lecture' is the other valid value
+  // quiz_style defaults to 'nclex'; 'lecture' is the only other valid value
   const quizStyle = quiz_style === 'lecture' ? 'lecture' : 'nclex';
+
+  // ── Look up the document owner ────────────────────────────────────────────
+  const { data: doc, error: docErr } = await supabase
+    .from('documents')
+    .select('user_id')
+    .eq('id', document_id)
+    .single();
+
+  if (docErr || !doc) {
+    return res.status(404).json({ error: 'Document not found' });
+  }
+
+  // ── Create the quiz_set row up front so questions can reference it ─────────
+  const { data: quizSet, error: quizSetErr } = await supabase
+    .from('quiz_sets')
+    .insert({
+      document_id,
+      user_id: doc.user_id,
+      quiz_style: quizStyle,
+      question_count: questionCount,
+      label: quiz_set_label ?? null,
+    })
+    .select('id')
+    .single();
+
+  if (quizSetErr || !quizSet) {
+    console.error('Failed to create quiz_set:', quizSetErr);
+    return res.status(500).json({ error: 'Failed to create quiz set' });
+  }
+
+  const quizSetId = quizSet.id;
 
   console.log(
     `Generating questions for document: ${document_id}` +
-    (questionCount ? ` (target: ${questionCount} questions)` : ' (all concepts)') +
-    ` [style: ${quizStyle}]`
+    ` (target: ${questionCount}) [style: ${quizStyle}] [quiz_set: ${quizSetId}]`
   );
 
   try {
-    const result = await generateQuestions(document_id, questionCount, quizStyle);
+    const result = await generateQuestions(document_id, questionCount, quizStyle, quizSetId);
     res.status(200).json({
       success: true,
       document_id,
+      quiz_set_id: quizSetId,
       questions_generated: result,
     });
   } catch (error) {

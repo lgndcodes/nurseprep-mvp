@@ -366,10 +366,11 @@ ${context}`,
   return redistributeAnswers(questions);
 }
 
-async function validateAndStore(questions, documentId, conceptId) {
+async function validateAndStore(questions, documentId, conceptId, quizSetId) {
   const rows = questions.map((q) => ({
     document_id: documentId,
     concept_id: conceptId,
+    quiz_set_id: quizSetId ?? null,
     question_text: q.question_text,
     question_type: q.question_type,
     answer_choices: q.answer_choices,
@@ -408,8 +409,9 @@ async function validateAndStore(questions, documentId, conceptId) {
  * @param {number}        opts.logTotal            - total concept count shown in logs
  * @param {number|null}   opts.questionCountLimit  - stop early once this many questions are stored
  * @param {'nclex'|'lecture'} opts.quizStyle       - question generation style
+ * @param {string|null}   opts.quizSetId           - quiz_set row to tag each question with
  */
-async function processConcepts(documentId, concepts, { logOffset = 0, logTotal = null, questionCountLimit = null, quizStyle = 'nclex' } = {}) {
+async function processConcepts(documentId, concepts, { logOffset = 0, logTotal = null, questionCountLimit = null, quizStyle = 'nclex', quizSetId = null } = {}) {
   const displayTotal = logTotal ?? concepts.length;
   const BATCH_SIZE = 5;
   let totalQuestions = 0;
@@ -442,7 +444,7 @@ async function processConcepts(documentId, concepts, { logOffset = 0, logTotal =
           const questions = await generateQuestionsForConcept(concept, relevantChunks, quizStyle);
 
           if (!questions.length) return 0;
-          return validateAndStore(questions, documentId, concept.id);
+          return validateAndStore(questions, documentId, concept.id, quizSetId);
         })();
       })
     );
@@ -514,16 +516,16 @@ async function cleanup(documentId) {
  * @param {string}            documentId
  * @param {number|null}       questionCount  - target number of questions; null = all concepts
  * @param {'nclex'|'lecture'} [quizStyle='nclex'] - question generation style
+ * @param {string|null}       [quizSetId=null]    - quiz_sets row id to tag every question with
  *
  * When questionCount is provided:
  *   1. Process ceil(questionCount/3) highest-importance concepts (priority batch).
- *      generateNotes runs in parallel with this batch so it adds zero wall-clock time.
  *   2. Immediately mark the document "ready" so students can start.
  *   3. Continue generating remaining concepts in the background.
  *
  * Returns the number of questions produced by the priority batch.
  */
-async function generateQuestions(documentId, questionCount = null, quizStyle = 'nclex') {
+async function generateQuestions(documentId, questionCount = null, quizStyle = 'nclex', quizSetId = null) {
   const { data: chunkRows, error: chunkErr } = await supabase
     .from('document_chunks')
     .select('chunk_text, chunk_index')
@@ -549,16 +551,13 @@ async function generateQuestions(documentId, questionCount = null, quizStyle = '
   const priorityConcepts  = sorted.slice(0, priorityCount);
   const remainingConcepts = sorted.slice(priorityCount);
 
-  // ── Priority batch + notes in parallel ────────────────────────────────────
-  // generateNotes is fire-and-catch — its failure never blocks questions
-  const [priorityTotal] = await Promise.all([
-    processConcepts(documentId, priorityConcepts, {
-      logOffset: 0,
-      logTotal: totalConcepts,
-      quizStyle,
-    }),
-    generateNotes(documentId, chunks),
-  ]);
+  // ── Priority batch ────────────────────────────────────────────────────────
+  const priorityTotal = await processConcepts(documentId, priorityConcepts, {
+    logOffset: 0,
+    logTotal: totalConcepts,
+    quizStyle,
+    quizSetId,
+  });
 
   // ── Trim to exact questionCount if a target was specified ──────────────────
   if (questionCount) {
@@ -590,6 +589,7 @@ async function generateQuestions(documentId, questionCount = null, quizStyle = '
         logTotal: totalConcepts,
         questionCountLimit: questionCount,
         quizStyle,
+        quizSetId,
       });
       await cleanup(documentId);
       console.log(`Full generation complete. Total questions: ${priorityTotal + remainingTotal}`);
@@ -607,4 +607,5 @@ async function generateQuestions(documentId, questionCount = null, quizStyle = '
 
 module.exports = {
   generateQuestions,
+  generateNotes,
 };

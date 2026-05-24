@@ -6,6 +6,7 @@ const pdfParse = require('pdf-parse');
 const officeparser = require('officeparser');
 const supabase = require('./supabase');
 const { embedTexts } = require('./embeddings');
+const { generateNotes } = require('./generate-questions');
 
 function chunkText(text, chunkSize = 2000, overlap = 200) {
   if (overlap >= chunkSize) {
@@ -48,14 +49,14 @@ async function processDocument(documentId) {
 
     const { data: doc, error: docError } = await supabase
       .from('documents')
-      .select('storage_path, filename, quiz_style')
+      .select('storage_path, filename')
       .eq('id', documentId)
       .single();
 
     if (docError) throw docError;
     if (!doc) throw new Error('Document not found');
 
-    const { storage_path: storagePath, filename, quiz_style: quizStyle } = doc;
+    const { storage_path: storagePath, filename } = doc;
     console.log(`Found document: ${filename}`);
 
     console.log('Downloading from bucket: documents, path:', JSON.stringify(storagePath));
@@ -107,12 +108,14 @@ async function processDocument(documentId) {
 
     console.log(`Stored ${chunks.length} chunks with embeddings`);
 
-    const { error: readyError } = await supabase
-      .from('documents')
-      .update({ status: 'ready' })
-      .eq('id', documentId);
+    // Generate notes and mark document ready in parallel.
+    // generateNotes has its own error handling and will never throw.
+    const [readyResult] = await Promise.all([
+      supabase.from('documents').update({ status: 'ready' }).eq('id', documentId),
+      generateNotes(documentId, chunks),
+    ]);
 
-    if (readyError) throw readyError;
+    if (readyResult.error) throw readyResult.error;
 
     const { error: removeError } = await supabase.storage.from('documents').remove([storagePath]);
     if (removeError) {
