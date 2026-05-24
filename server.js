@@ -103,7 +103,7 @@ Return ONLY this JSON structure (no other text):
 });
 
 app.post('/generate-questions', requireApiKey, async (req, res) => {
-  const { document_id, question_count } = req.body;
+  const { document_id, question_count, quiz_style } = req.body;
   if (!document_id) {
     return res.status(400).json({ error: 'document_id is required' });
   }
@@ -112,13 +112,17 @@ app.post('/generate-questions', requireApiKey, async (req, res) => {
   const questionCount =
     Number.isInteger(question_count) && question_count > 0 ? question_count : null;
 
+  // quiz_style defaults to 'nclex'; only 'lecture' is the other valid value
+  const quizStyle = quiz_style === 'lecture' ? 'lecture' : 'nclex';
+
   console.log(
     `Generating questions for document: ${document_id}` +
-    (questionCount ? ` (target: ${questionCount} questions)` : ' (all concepts)')
+    (questionCount ? ` (target: ${questionCount} questions)` : ' (all concepts)') +
+    ` [style: ${quizStyle}]`
   );
 
   try {
-    const result = await generateQuestions(document_id, questionCount);
+    const result = await generateQuestions(document_id, questionCount, quizStyle);
     res.status(200).json({
       success: true,
       document_id,

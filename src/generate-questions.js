@@ -79,6 +79,85 @@ ${context}`,
   return inserted;
 }
 
+/**
+ * Generate structured study notes from the first 8 chunks of the document
+ * and insert them into the notes table.  Errors are caught and logged so a
+ * notes failure never blocks question generation.
+ */
+async function generateNotes(documentId, chunks) {
+  try {
+    // Fetch user_id so the note is owned by the right user
+    const { data: doc, error: docErr } = await supabase
+      .from('documents')
+      .select('user_id')
+      .eq('id', documentId)
+      .single();
+
+    if (docErr) throw docErr;
+
+    const context = chunks.slice(0, 8).join('\n\n---\n\n');
+
+    const message = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 8000,
+      system:
+        'You are an expert nursing educator who creates clear, engaging study notes that help nursing students quickly grasp key concepts from their lecture materials.',
+      messages: [
+        {
+          role: 'user',
+          content: `Create comprehensive study notes from this nursing lecture material. Return ONLY a JSON object with this exact structure:
+{
+  "title": "topic name based on content",
+  "summary": "two sentence overview of the entire topic",
+  "key_concepts": [
+    {
+      "term": "key nursing term",
+      "definition": "clear simple definition",
+      "clinical_relevance": "why this matters in practice"
+    }
+  ],
+  "main_sections": [
+    {
+      "heading": "section title",
+      "bullets": ["key point 1", "key point 2"],
+      "clinical_pearl": "one practical nursing insight for this section"
+    }
+  ],
+  "priority_facts": ["most testable fact 1", "most testable fact 2", "most testable fact 3"],
+  "common_mistakes": ["mistake students make 1", "mistake students make 2"],
+  "mnemonics": ["any helpful memory aids from the content"]
+}
+
+Material: ${context}`,
+        },
+      ],
+    });
+
+    const responseText = getAssistantText(message);
+
+    let notes;
+    try {
+      notes = parseClaudeJson(responseText);
+    } catch (parseErr) {
+      console.warn('generateNotes: failed to parse JSON from Claude:', parseErr);
+      return;
+    }
+
+    const { error: insertErr } = await supabase.from('notes').insert({
+      document_id: documentId,
+      user_id: doc.user_id,
+      content: notes,
+    });
+
+    if (insertErr) throw insertErr;
+
+    console.log(`Generated and stored notes: "${notes.title ?? documentId}"`);
+  } catch (err) {
+    // Notes failure must never block question generation
+    console.error('generateNotes failed (non-fatal):', err);
+  }
+}
+
 async function getRelevantChunks(documentId, topicName) {
   const embedding = await embedText(topicName);
 
@@ -160,24 +239,39 @@ function redistributeAnswers(questions) {
   });
 }
 
-async function generateQuestionsForConcept(concept, relevantChunks) {
+/**
+ * @param {object} concept
+ * @param {string[]} relevantChunks
+ * @param {'nclex'|'lecture'} [quizStyle='nclex']
+ */
+async function generateQuestionsForConcept(concept, relevantChunks, quizStyle = 'nclex') {
   const context = relevantChunks.length
     ? relevantChunks.join('\n\n---\n\n')
     : '(No matching chunks.)';
 
+  const isLecture = quizStyle === 'lecture';
+
+  const questionStyleHeader = isLecture
+    ? `Using ONLY the study material below, generate exactly 3 exam questions about: "${concept.topic_name}".`
+    : `Using ONLY the study material below, generate exactly 3 difficult NCLEX-style exam questions about: "${concept.topic_name}".`;
+
+  const styleRequirements = isLecture
+    ? `- Generate questions that test direct recall and understanding of specific facts, definitions, and procedures as they would appear on a nursing classroom exam. Questions should be more straightforward than NCLEX style, testing whether students know specific information from their lecture material rather than complex clinical judgment scenarios.`
+    : `- Questions must require clinical judgment and application, not memorization.\n- Use realistic patient scenarios with clinical context where appropriate.`;
+
   const createParams = {
     model: MODEL,
     max_tokens: 12000,
-    system:
-      'You are an expert NCLEX question writer and nursing educator. You write difficult, clinically realistic questions and complete rationales in one pass.',
+    system: isLecture
+      ? 'You are an expert nursing educator who writes classroom exam questions that test direct knowledge and recall of lecture material.'
+      : 'You are an expert NCLEX question writer and nursing educator. You write difficult, clinically realistic questions and complete rationales in one pass.',
     messages: [
       {
         role: 'user',
-        content: `Using ONLY the study material below, generate exactly 3 difficult NCLEX-style exam questions about: "${concept.topic_name}".
+        content: `${questionStyleHeader}
 
 Requirements:
-- Questions must require clinical judgment and application, not memorization.
-- Use realistic patient scenarios with clinical context where appropriate.
+${styleRequirements}
 - For EACH question in the same response: write the question, full rationales, and self-review quality (quality_passes).
 - Use ONLY information from the provided material.
 - IMPORTANT: Vary the correct answer letter unpredictably across questions. Avoid patterns where the same letter (especially B) is correct more than once in a row or dominates the question set. A student should not be able to guess above 30% by always selecting the same letter. The correct answer should feel genuinely random in its placement.
@@ -277,12 +371,12 @@ async function validateAndStore(questions, documentId, conceptId) {
  * @param {string}   documentId
  * @param {object[]} concepts      - subset to process
  * @param {object}   opts
- * @param {number}   opts.logOffset         - display index offset (for logging)
- * @param {number}   opts.logTotal           - total concept count shown in logs
- * @param {number|null} opts.questionCountLimit - stop early once this many
- *                                               questions are already stored
+ * @param {number}        opts.logOffset          - display index offset (for logging)
+ * @param {number}        opts.logTotal            - total concept count shown in logs
+ * @param {number|null}   opts.questionCountLimit  - stop early once this many questions are stored
+ * @param {'nclex'|'lecture'} opts.quizStyle       - question generation style
  */
-async function processConcepts(documentId, concepts, { logOffset = 0, logTotal = null, questionCountLimit = null } = {}) {
+async function processConcepts(documentId, concepts, { logOffset = 0, logTotal = null, questionCountLimit = null, quizStyle = 'nclex' } = {}) {
   const displayTotal = logTotal ?? concepts.length;
   const BATCH_SIZE = 5;
   let totalQuestions = 0;
@@ -312,7 +406,7 @@ async function processConcepts(documentId, concepts, { logOffset = 0, logTotal =
           console.log(`[generateQuestions] Concept ${displayIndex}/${displayTotal}: ${concept.topic_name}`);
 
           const relevantChunks = await getRelevantChunks(documentId, concept.topic_name);
-          const questions = await generateQuestionsForConcept(concept, relevantChunks);
+          const questions = await generateQuestionsForConcept(concept, relevantChunks, quizStyle);
 
           if (!questions.length) return 0;
           return validateAndStore(questions, documentId, concept.id);
@@ -384,20 +478,19 @@ async function cleanup(documentId) {
 /**
  * Main entry point.
  *
- * @param {string}      documentId
- * @param {number|null} questionCount  - target number of questions.  If null,
- *                                       all concepts are processed before the
- *                                       document is marked ready.
+ * @param {string}            documentId
+ * @param {number|null}       questionCount  - target number of questions; null = all concepts
+ * @param {'nclex'|'lecture'} [quizStyle='nclex'] - question generation style
  *
  * When questionCount is provided:
  *   1. Process ceil(questionCount/3) highest-importance concepts (priority batch).
+ *      generateNotes runs in parallel with this batch so it adds zero wall-clock time.
  *   2. Immediately mark the document "ready" so students can start.
  *   3. Continue generating remaining concepts in the background.
  *
- * Returns the number of questions produced by the priority batch so the HTTP
- * response can acknowledge them quickly.
+ * Returns the number of questions produced by the priority batch.
  */
-async function generateQuestions(documentId, questionCount = null) {
+async function generateQuestions(documentId, questionCount = null, quizStyle = 'nclex') {
   const { data: chunkRows, error: chunkErr } = await supabase
     .from('document_chunks')
     .select('chunk_text, chunk_index')
@@ -423,11 +516,16 @@ async function generateQuestions(documentId, questionCount = null) {
   const priorityConcepts  = sorted.slice(0, priorityCount);
   const remainingConcepts = sorted.slice(priorityCount);
 
-  // ── Priority batch ──────────────────────────────────────────────────────────
-  const priorityTotal = await processConcepts(documentId, priorityConcepts, {
-    logOffset: 0,
-    logTotal: totalConcepts,
-  });
+  // ── Priority batch + notes in parallel ────────────────────────────────────
+  // generateNotes is fire-and-catch — its failure never blocks questions
+  const [priorityTotal] = await Promise.all([
+    processConcepts(documentId, priorityConcepts, {
+      logOffset: 0,
+      logTotal: totalConcepts,
+      quizStyle,
+    }),
+    generateNotes(documentId, chunks),
+  ]);
 
   // ── Trim to exact questionCount if a target was specified ──────────────────
   if (questionCount) {
@@ -457,7 +555,8 @@ async function generateQuestions(documentId, questionCount = null) {
       const remainingTotal = await processConcepts(documentId, remainingConcepts, {
         logOffset: priorityCount,
         logTotal: totalConcepts,
-        questionCountLimit: questionCount,   // null when no limit was requested
+        questionCountLimit: questionCount,
+        quizStyle,
       });
       await cleanup(documentId);
       console.log(`Full generation complete. Total questions: ${priorityTotal + remainingTotal}`);

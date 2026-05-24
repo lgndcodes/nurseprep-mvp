@@ -48,14 +48,14 @@ async function processDocument(documentId) {
 
     const { data: doc, error: docError } = await supabase
       .from('documents')
-      .select('storage_path, filename')
+      .select('storage_path, filename, quiz_style')
       .eq('id', documentId)
       .single();
 
     if (docError) throw docError;
     if (!doc) throw new Error('Document not found');
 
-    const { storage_path: storagePath, filename } = doc;
+    const { storage_path: storagePath, filename, quiz_style: quizStyle } = doc;
     console.log(`Found document: ${filename}`);
 
     console.log('Downloading from bucket: documents, path:', JSON.stringify(storagePath));
