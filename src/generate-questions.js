@@ -105,28 +105,61 @@ async function generateNotes(documentId, chunks) {
       messages: [
         {
           role: 'user',
-          content: `Create comprehensive study notes from this nursing lecture material. Return ONLY a JSON object with this exact structure:
+          content: `Create comprehensive clinical study notes from this nursing lecture material. Analyze the content and include ONLY sections that are relevant to this specific topic. Return ONLY a JSON object with this exact structure - omit any section if the content does not support it:
+
 {
   "title": "topic name based on content",
-  "summary": "two sentence overview of the entire topic",
+  "summary": "two to three sentence overview of the entire topic",
   "key_concepts": [
     {
       "term": "key nursing term",
-      "definition": "clear simple definition",
-      "clinical_relevance": "why this matters in practice"
+      "definition": "clear simple definition a student would understand",
+      "clinical_relevance": "why this matters in nursing practice"
     }
+  ],
+  "signs_and_symptoms": {
+    "early": ["early sign 1", "early sign 2"],
+    "late": ["late sign 1", "late sign 2"],
+    "general": ["symptom if not early/late specific"]
+  },
+  "contraindications": [
+    {
+      "item": "drug or condition name",
+      "reason": "why it is contraindicated"
+    }
+  ],
+  "treatments": [
+    {
+      "name": "treatment name",
+      "details": "how it works or key nursing considerations"
+    }
+  ],
+  "patient_education": [
+    "specific thing nurse would teach patient about this condition"
+  ],
+  "priorities": [
+    "most important testable fact or nursing priority"
   ],
   "main_sections": [
     {
       "heading": "section title",
       "bullets": ["key point 1", "key point 2"],
-      "clinical_pearl": "one practical nursing insight for this section"
+      "clinical_pearl": "one practical nursing insight"
     }
   ],
-  "priority_facts": ["most testable fact 1", "most testable fact 2", "most testable fact 3"],
-  "common_mistakes": ["mistake students make 1", "mistake students make 2"],
-  "mnemonics": ["any helpful memory aids from the content"]
+  "common_mistakes": [
+    "common student misconception or error about this topic"
+  ],
+  "mnemonics": [
+    "helpful memory aid if one exists for this content"
+  ]
 }
+
+Only include signs_and_symptoms if the content discusses clinical presentation.
+Only include contraindications if the content discusses medications or treatments with restrictions.
+Only include treatments if the content discusses management or interventions.
+Only include patient_education if the content discusses what patients need to know.
+Always include summary, key_concepts, priorities, and main_sections if there is enough content.
 
 Material: ${context}`,
         },
